@@ -881,8 +881,21 @@ fn ensure_shared_chat_visibility_for_instances(
     instances: &[CodexSyncInstance],
     target_instance_id: &str,
 ) -> Result<CodexSharedChatVisibilitySummary, String> {
-    promote_materialized_shared_chat_updates_to_sources(instances)?;
     let target = find_instance(instances, target_instance_id)?.clone();
+    if instance_uses_shared_canonical_history(instances, &target) {
+        return Ok(CodexSharedChatVisibilitySummary {
+            target_instance_id: target.id,
+            target_instance_name: target.name,
+            materialized_foreign_count: 0,
+            copied_same_account_count: 0,
+            removed_unsafe_same_id_count: 0,
+            backup_dir: None,
+            message: "Shared chat visibility skipped: instance uses canonical shared history"
+                .to_string(),
+        });
+    }
+
+    promote_materialized_shared_chat_updates_to_sources(instances)?;
     if !target.data_dir.join(STATE_DB_FILE).exists() {
         return Ok(CodexSharedChatVisibilitySummary {
             target_instance_id: target.id,
@@ -1048,6 +1061,29 @@ fn ensure_shared_chat_visibility_for_instances(
         backup_dir: backup_dir.map(|path| path.to_string_lossy().to_string()),
         message,
     })
+}
+
+fn paths_point_to_same_location(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => a == b,
+    }
+}
+
+fn instance_uses_shared_canonical_history(
+    instances: &[CodexSyncInstance],
+    target: &CodexSyncInstance,
+) -> bool {
+    let target_db = target.data_dir.join(STATE_DB_FILE);
+    if !target_db.exists() {
+        return false;
+    }
+
+    instances
+        .iter()
+        .filter(|instance| instance.id != target.id)
+        .map(|instance| instance.data_dir.join(STATE_DB_FILE))
+        .any(|other_db| other_db.exists() && paths_point_to_same_location(&target_db, &other_db))
 }
 
 fn find_instance<'a>(
@@ -3093,6 +3129,28 @@ mod tests {
         let resolved = resolve_profile_account_id(&root, Some("stale-bound-account".to_string()));
 
         assert_eq!(resolved.as_deref(), Some("account-from-profile"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn shared_chat_visibility_noops_when_instances_share_canonical_state_db() {
+        let root = make_temp_dir("codex-shared-canonical-history-test");
+        create_threads_db(&root);
+        write_thread(&root, "source-thread", "Source title", false, 100);
+        let instances = vec![
+            test_instance("__default__", "Default", "account-a", root.clone()),
+            test_instance("second", "Second", "account-b", root.clone()),
+        ];
+
+        let summary = ensure_shared_chat_visibility_for_instances(&instances, "second")
+            .expect("sync shared canonical history");
+
+        assert_eq!(summary.materialized_foreign_count, 0);
+        assert_eq!(summary.copied_same_account_count, 0);
+        assert_eq!(summary.removed_unsafe_same_id_count, 0);
+        assert_eq!(thread_ids(&root), vec!["source-thread".to_string()]);
+        assert!(!root.join(SHARED_CHAT_CATALOG_FILE).exists());
+
         let _ = fs::remove_dir_all(&root);
     }
 

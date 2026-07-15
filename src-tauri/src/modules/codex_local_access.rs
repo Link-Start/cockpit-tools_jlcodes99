@@ -65,8 +65,6 @@ const CODEX_LOCAL_ACCESS_FILE: &str = "codex_local_access.json";
 const CODEX_LOCAL_ACCESS_CHAT_TEST_STREAM_EVENT: &str = "codex-local-access-chat-test-stream";
 const CODEX_LOCAL_ACCESS_MODEL_PRICING_REPRICE_EVENT: &str =
     "codex-local-access-model-pricing-reprice";
-const CODEX_LOCAL_ACCESS_TEST_DISABLE_IMAGE_GENERATION_HEADER: &str =
-    "x-agtools-disable-image-generation";
 const CODEX_LOCAL_ACCESS_STATS_FILE: &str = "codex_local_access_stats.json";
 const CODEX_LOCAL_ACCESS_LOGS_DB_FILE: &str = "codex_local_access_logs.sqlite";
 const CODEX_LOCAL_ACCESS_TAKEOVER_BACKUPS_FILE: &str = "codex_local_access_takeover_backups.json";
@@ -2773,23 +2771,10 @@ fn image_generation_tools_allowed(
 }
 
 fn request_image_generation_mode(
-    collection_mode: CodexLocalAccessImageGenerationMode,
-    headers: &HashMap<String, String>,
+    _collection_mode: CodexLocalAccessImageGenerationMode,
+    _headers: &HashMap<String, String>,
 ) -> CodexLocalAccessImageGenerationMode {
-    if collection_mode == CodexLocalAccessImageGenerationMode::Disabled {
-        return CodexLocalAccessImageGenerationMode::Disabled;
-    }
-    let value = headers
-        .get(CODEX_LOCAL_ACCESS_TEST_DISABLE_IMAGE_GENERATION_HEADER)
-        .map(String::as_str)
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
-    match value.as_str() {
-        "chat" | "images_only" | "images-only" => CodexLocalAccessImageGenerationMode::ImagesOnly,
-        "true" | "all" | "disabled" => CodexLocalAccessImageGenerationMode::Disabled,
-        _ => collection_mode,
-    }
+    CodexLocalAccessImageGenerationMode::Enabled
 }
 
 fn build_images_responses_body(prompt: &str, images: &[String], tool: Value) -> Value {
@@ -6166,8 +6151,8 @@ fn calculate_usage_cost_usd_from_tokens(
     }
 }
 
-fn trim_recent_events(events: &mut Vec<CodexLocalAccessUsageEvent>, month_since: i64) {
-    events.retain(|event| event.timestamp > 0 && event.timestamp >= month_since);
+fn trim_recent_events(events: &mut Vec<CodexLocalAccessUsageEvent>, retention_since: i64) {
+    events.retain(|event| event.timestamp > 0 && event.timestamp >= retention_since);
     events.sort_by_key(|event| event.timestamp);
 }
 
@@ -7559,12 +7544,17 @@ fn load_local_access_usage_events_since(
         .map_err(|e| format!("解析 API 服务日志失败: {}", e))
 }
 
+fn local_calendar_window_starts(now: i64) -> (i64, i64, i64) {
+    let starts = calendar_stats_window_starts(now);
+    (starts.day, starts.week, starts.month)
+}
+
 fn stats_range_since(stats_range: Option<&str>) -> Option<i64> {
-    let window_starts = calendar_stats_window_starts(now_ms());
+    let (day_since, week_since, month_since) = local_calendar_window_starts(now_ms());
     match stats_range.map(str::trim) {
-        Some("daily") => Some(window_starts.day),
-        Some("weekly") => Some(window_starts.week),
-        Some("monthly") => Some(window_starts.month),
+        Some("daily") => Some(day_since),
+        Some("weekly") => Some(week_since),
+        Some("monthly") => Some(month_since),
         _ => None,
     }
 }
@@ -7597,10 +7587,12 @@ fn empty_usage_event_page(page: u32, page_size: u32) -> CodexLocalAccessUsageEve
     }
 }
 
-pub async fn query_local_access_usage_events(
+fn query_local_access_usage_events_blocking(
     page: u32,
     page_size: u32,
     stats_range: Option<String>,
+    start_at: Option<i64>,
+    end_at: Option<i64>,
     model_query: Option<String>,
     account_query: Option<String>,
     api_key_query: Option<String>,
@@ -7609,16 +7601,21 @@ pub async fn query_local_access_usage_events(
     success: Option<bool>,
     error_category: Option<String>,
 ) -> Result<CodexLocalAccessUsageEventPage, String> {
-    ensure_runtime_loaded_without_start().await?;
-
     let page_size = page_size.clamp(1, 200);
     let page = page.max(1);
     let mut clauses = Vec::new();
     let mut params = Vec::<SqlValue>::new();
 
-    if let Some(since) = stats_range_since(stats_range.as_deref()) {
+    if let Some(start_at) = start_at {
+        clauses.push("timestamp >= ?".to_string());
+        params.push(SqlValue::Integer(start_at));
+    } else if let Some(since) = stats_range_since(stats_range.as_deref()) {
         clauses.push("timestamp >= ?".to_string());
         params.push(SqlValue::Integer(since));
+    }
+    if let Some(end_at) = end_at {
+        clauses.push("timestamp <= ?".to_string());
+        params.push(SqlValue::Integer(end_at));
     }
     push_like_filter(&mut clauses, &mut params, "model_id LIKE ?", model_query);
     push_like_filter(
@@ -7783,6 +7780,96 @@ pub async fn query_local_access_usage_events(
         page_size,
         total_pages,
     })
+}
+
+pub async fn query_local_access_usage_events(
+    page: u32,
+    page_size: u32,
+    stats_range: Option<String>,
+    start_at: Option<i64>,
+    end_at: Option<i64>,
+    model_query: Option<String>,
+    account_query: Option<String>,
+    api_key_query: Option<String>,
+    gateway_mode: Option<CodexLocalAccessGatewayMode>,
+    request_kind: Option<CodexLocalAccessRequestKind>,
+    success: Option<bool>,
+    error_category: Option<String>,
+) -> Result<CodexLocalAccessUsageEventPage, String> {
+    ensure_runtime_loaded_without_start().await?;
+    tauri::async_runtime::spawn_blocking(move || {
+        query_local_access_usage_events_blocking(
+            page,
+            page_size,
+            stats_range,
+            start_at,
+            end_at,
+            model_query,
+            account_query,
+            api_key_query,
+            gateway_mode,
+            request_kind,
+            success,
+            error_category,
+        )
+    })
+    .await
+    .map_err(|e| format!("查询 API 服务请求日志任务失败: {}", e))?
+}
+
+fn query_local_access_stats_window_blocking(
+    start_at: i64,
+    end_at: i64,
+) -> Result<CodexLocalAccessStatsWindow, String> {
+    if start_at < 0 || end_at < start_at {
+        return Err("统计时间范围无效：结束时间必须不早于开始时间".to_string());
+    }
+    let conn = open_local_access_logs_db()?;
+    let service_tier_select = if request_logs_has_service_tier_column(&conn)
+        .map_err(|e| format!("检查 API 服务日志 service_tier 列失败: {}", e))?
+    {
+        "service_tier"
+    } else {
+        "'' AS service_tier"
+    };
+    let sql = format!(
+        r#"SELECT timestamp, request_id, account_id, email, api_key_id, api_key_label,
+                  model_id, gateway_mode, request_kind, {service_tier_select}, success,
+                  http_status, error_category, error_message, latency_ms, input_tokens,
+                  output_tokens, total_tokens, cached_tokens, reasoning_tokens,
+                  estimated_cost_usd, model_pricing_version, input_usd_per_million,
+                  output_usd_per_million, cached_input_usd_per_million
+           FROM request_logs
+           WHERE timestamp >= ?1 AND timestamp <= ?2
+           ORDER BY timestamp ASC, id ASC"#
+    );
+    let mut statement = conn
+        .prepare(sql.as_str())
+        .map_err(|e| format!("准备 API 服务统计查询失败: {}", e))?;
+    let mut window = empty_stats_window(start_at, start_at);
+    let rows = statement
+        .query_map(params![start_at, end_at], usage_event_from_row)
+        .map_err(|e| format!("查询 API 服务统计失败: {}", e))?;
+    for row in rows {
+        let event = row.map_err(|e| format!("解析 API 服务统计失败: {}", e))?;
+        apply_usage_event_to_window(&mut window, &event);
+    }
+    sort_usage_accounts(&mut window.accounts);
+    sort_usage_models(&mut window.models);
+    sort_usage_api_keys(&mut window.api_keys);
+    Ok(window)
+}
+
+pub async fn query_local_access_stats_window(
+    start_at: i64,
+    end_at: i64,
+) -> Result<CodexLocalAccessStatsWindow, String> {
+    ensure_runtime_loaded_without_start().await?;
+    tauri::async_runtime::spawn_blocking(move || {
+        query_local_access_stats_window_blocking(start_at, end_at)
+    })
+    .await
+    .map_err(|e| format!("统计 API 服务时间范围任务失败: {}", e))?
 }
 
 fn apply_usage_event_to_stats(
@@ -7994,12 +8081,9 @@ fn apply_usage_event_to_window(
 }
 
 fn recompute_time_windows(stats: &mut CodexLocalAccessStats, now: i64) {
-    let window_starts = calendar_stats_window_starts(now);
-    let day_since = window_starts.day;
-    let week_since = window_starts.week;
-    let month_since = window_starts.month;
+    let (day_since, week_since, month_since) = local_calendar_window_starts(now);
 
-    trim_recent_events(&mut stats.events, month_since);
+    trim_recent_events(&mut stats.events, week_since.min(month_since));
 
     let mut daily = empty_stats_window(day_since, stats.updated_at.max(day_since));
     let mut weekly = empty_stats_window(week_since, stats.updated_at.max(week_since));
@@ -8092,10 +8176,7 @@ fn apply_reprice_changes_to_stats(
     }
 
     let now = now_ms();
-    let window_starts = calendar_stats_window_starts(now);
-    let day_since = window_starts.day;
-    let week_since = window_starts.week;
-    let month_since = window_starts.month;
+    let (day_since, week_since, month_since) = local_calendar_window_starts(now);
     let event_indexes =
         stats
             .events
@@ -8343,6 +8424,7 @@ fn inspect_local_access_profile_config(
     config_text: &str,
     expected_base_url: &str,
     expected_api_key: &str,
+    uses_bound_oauth_auth: bool,
 ) -> Result<ProfileConfigInspection, String> {
     let doc = crate::modules::codex_config_format::read_codex_config_doc_from_str(config_text)
         .map_err(|e| format!("解析 Codex config.toml 失败: {}", e))?;
@@ -8368,13 +8450,18 @@ fn inspect_local_access_profile_config(
         .and_then(|item| item.as_str())
         .map(str::trim)
         == Some("responses");
-    let openai_auth_disabled = provider_table
+    let requires_openai_auth = provider_table
         .and_then(|table| table.get("requires_openai_auth"))
-        .and_then(|item| item.as_bool())
-        == Some(false);
+        .and_then(|item| item.as_bool());
     let imagegen_actor_authorized = provider_table.is_some_and(|table| {
         provider_has_nonempty_static_header(table, CODEX_IMAGEGEN_ACTOR_HEADER)
     });
+    // OAuth 投影必须继续使用官方登录态；只有普通 API Key 投影才使用生图兼容配置。
+    let auth_projection_matches = if uses_bound_oauth_auth {
+        requires_openai_auth == Some(true) && !imagegen_actor_authorized
+    } else {
+        requires_openai_auth == Some(false) && imagegen_actor_authorized
+    };
     let token_matched = provider_table
         .and_then(|table| table.get("experimental_bearer_token"))
         .and_then(|item| item.as_str())
@@ -8386,8 +8473,7 @@ fn inspect_local_access_profile_config(
         && provider_table.is_some()
         && profile_base_url_matches(base_url.as_deref(), expected_base_url)
         && wire_api_matches
-        && openai_auth_disabled
-        && imagegen_actor_authorized
+        && auth_projection_matches
         && token_matched;
 
     Ok(ProfileConfigInspection {
@@ -8418,6 +8504,8 @@ fn inspect_local_access_profile_attachment(
 
     let expected_base_url = build_collection_base_url(collection);
     let expected_api_key = collection.api_key.trim();
+    let has_bound_oauth =
+        normalize_optional_account_ref(collection.bound_oauth_account_id.as_deref()).is_some();
     let mut attachment = CodexLocalAccessProfileAttachment {
         profile_dir: profile_dir_text,
         attached: false,
@@ -8429,11 +8517,26 @@ fn inspect_local_access_profile_attachment(
         error: None,
     };
 
+    let auth_text = match read_optional_profile_file(&profile_auth_path(profile_dir)) {
+        Ok(content) => content,
+        Err(error) => {
+            attachment.error = Some(error);
+            None
+        }
+    };
+    let uses_bound_oauth_auth = auth_text
+        .as_deref()
+        .is_some_and(|text| has_bound_oauth && is_codex_oauth_auth_text(text));
+    attachment.auth_attached = auth_text.as_deref().is_some_and(|text| {
+        uses_bound_oauth_auth || is_codex_local_access_auth_text(text, expected_api_key)
+    });
+
     match read_optional_profile_file(&profile_config_path(profile_dir)) {
         Ok(Some(config_text)) => match inspect_local_access_profile_config(
             &config_text,
             &expected_base_url,
             expected_api_key,
+            uses_bound_oauth_auth,
         ) {
             Ok(inspection) => {
                 attachment.config_attached = inspection.config_attached;
@@ -8444,20 +8547,12 @@ fn inspect_local_access_profile_attachment(
                 }
             }
             Err(error) => {
-                attachment.error = Some(error);
+                attachment.error = Some(match attachment.error.take() {
+                    Some(existing) => format!("{}；{}", existing, error),
+                    None => error,
+                });
             }
         },
-        Ok(None) => {}
-        Err(error) => {
-            attachment.error = Some(error);
-        }
-    }
-
-    match read_optional_profile_file(&profile_auth_path(profile_dir)) {
-        Ok(Some(auth_text)) => {
-            attachment.auth_attached =
-                is_codex_local_access_auth_text(&auth_text, expected_api_key);
-        }
         Ok(None) => {}
         Err(error) => {
             attachment.error = Some(match attachment.error.take() {
@@ -8562,6 +8657,17 @@ fn is_codex_local_access_auth_text(auth_text: &str, api_key: &str) -> bool {
         && openai_api_key
             .map(|key| key == api_key || key.starts_with("agt_codex_"))
             .unwrap_or(false)
+}
+
+fn is_codex_oauth_auth_text(auth_text: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(auth_text) else {
+        return false;
+    };
+    value
+        .get("tokens")
+        .and_then(|tokens| tokens.get("id_token"))
+        .and_then(Value::as_str)
+        .is_some_and(|token| !token.trim().is_empty())
 }
 
 fn load_takeover_backups() -> Result<CodexLocalAccessTakeoverBackups, String> {
@@ -9154,16 +9260,6 @@ fn sidecar_auth_ids_for_account_ids_with_overrides(
 
 fn sidecar_duration_ms(value_ms: i64) -> String {
     format!("{}ms", value_ms.max(1))
-}
-
-fn sidecar_disable_image_generation_value(
-    mode: CodexLocalAccessImageGenerationMode,
-) -> serde_json::Value {
-    match mode {
-        CodexLocalAccessImageGenerationMode::Enabled => json!(false),
-        CodexLocalAccessImageGenerationMode::Disabled => json!(true),
-        CodexLocalAccessImageGenerationMode::ImagesOnly => json!("chat"),
-    }
 }
 
 fn sidecar_routing_strategy_value(strategy: CodexLocalAccessRoutingStrategy) -> &'static str {
@@ -10237,7 +10333,6 @@ async fn prepare_sidecar_launch_config_in_dir(
     let mut manifest_accounts = Vec::new();
     let mut codex_keys = Vec::new();
     let mut expected_auth_files = HashSet::new();
-    let mut effective_image_generation_mode = collection.image_generation_mode;
     for account_id in effective_sidecar_account_ids(collection) {
         if account_health_blocks_routing(health_snapshot.get(&account_id)) {
             logger::log_codex_api_warn(&format!(
@@ -10266,11 +10361,6 @@ async fn prepare_sidecar_launch_config_in_dir(
         };
         if !eligible {
             continue;
-        }
-
-        if account_uses_oauth_chat_image_generation_compat(&account) {
-            effective_image_generation_mode =
-                oauth_chat_image_generation_mode(effective_image_generation_mode);
         }
 
         if account.is_api_key_auth() {
@@ -10354,10 +10444,6 @@ async fn prepare_sidecar_launch_config_in_dir(
     config.insert("commercial-mode".to_string(), json!(true));
     config.insert("ws-auth".to_string(), json!(true));
     config.insert("disable-auth-auto-refresh".to_string(), json!(true));
-    config.insert(
-        "disable-image-generation".to_string(),
-        sidecar_disable_image_generation_value(effective_image_generation_mode),
-    );
     config.insert(
         "request-retry".to_string(),
         json!(MAX_REQUEST_RETRY_ATTEMPTS as i32),
@@ -11806,8 +11892,9 @@ fn load_stats_from_disk() -> Result<CodexLocalAccessStats, String> {
             error
         ));
     }
-    let month_since = calendar_stats_window_starts(now_ms()).month;
-    parsed.events = match load_local_access_usage_events_since(month_since) {
+    let (_, week_since, month_since) = local_calendar_window_starts(now_ms());
+    let retention_since = week_since.min(month_since);
+    parsed.events = match load_local_access_usage_events_since(retention_since) {
         Ok(events) => events,
         Err(error) => {
             logger::log_codex_api_warn(&format!(
@@ -11816,7 +11903,7 @@ fn load_stats_from_disk() -> Result<CodexLocalAccessStats, String> {
             ));
             json_events
                 .into_iter()
-                .filter(|event| event.timestamp >= month_since)
+                .filter(|event| event.timestamp >= retention_since)
                 .collect()
         }
     };
@@ -12944,6 +13031,11 @@ fn sanitize_collection_structure(
     collection: &mut CodexLocalAccessCollection,
 ) -> Result<bool, String> {
     let mut changed = false;
+
+    if collection.image_generation_mode != CodexLocalAccessImageGenerationMode::Enabled {
+        collection.image_generation_mode = CodexLocalAccessImageGenerationMode::Enabled;
+        changed = true;
+    }
 
     if collection.port == 0 {
         collection.port = allocate_initial_local_port(bind_host_for_collection(collection))?;
@@ -14382,6 +14474,7 @@ fn build_state_snapshot_inner(
         })
         .unwrap_or_else(supported_codex_model_ids);
     let mut stats = runtime.stats.clone();
+    recompute_time_windows(&mut stats, now_ms());
     stats.events = stats
         .events
         .iter()
@@ -14765,39 +14858,15 @@ pub fn account_requires_provider_gateway(account: &CodexAccount) -> bool {
 }
 
 pub fn account_requires_bound_oauth_local_gateway(account: &CodexAccount) -> bool {
-    account_uses_bound_oauth_image_generation_compat(account)
-        && !account_requires_provider_gateway(account)
-}
-
-fn account_uses_bound_oauth_image_generation_compat(account: &CodexAccount) -> bool {
-    account.is_api_key_auth()
-        && account.bound_oauth_use_local_gateway
-        && normalize_optional_account_ref(account.bound_oauth_account_id.as_deref()).is_some()
-}
-
-fn account_uses_oauth_chat_image_generation_compat(account: &CodexAccount) -> bool {
-    !account.is_api_key_auth() || account_uses_bound_oauth_image_generation_compat(account)
-}
-
-fn oauth_chat_image_generation_mode(
-    inherited_mode: CodexLocalAccessImageGenerationMode,
-) -> CodexLocalAccessImageGenerationMode {
-    if inherited_mode == CodexLocalAccessImageGenerationMode::Disabled {
-        CodexLocalAccessImageGenerationMode::Disabled
-    } else {
-        CodexLocalAccessImageGenerationMode::ImagesOnly
-    }
+    let _ = account;
+    false
 }
 
 fn provider_gateway_image_generation_mode_for_account(
-    account: &CodexAccount,
-    inherited_mode: CodexLocalAccessImageGenerationMode,
+    _account: &CodexAccount,
+    _inherited_mode: CodexLocalAccessImageGenerationMode,
 ) -> CodexLocalAccessImageGenerationMode {
-    if account_uses_bound_oauth_image_generation_compat(account) {
-        oauth_chat_image_generation_mode(inherited_mode)
-    } else {
-        inherited_mode
-    }
+    CodexLocalAccessImageGenerationMode::Enabled
 }
 
 pub fn is_local_access_runtime_account_id(account_id: &str) -> bool {
@@ -15166,7 +15235,7 @@ fn build_model_provider_gateway_test_collection(
     collection.access_scope = CodexLocalAccessScope::Localhost;
     collection.client_base_url_host = CodexLocalAccessClientBaseUrlHost::default();
     collection.gateway_mode = CodexLocalAccessGatewayMode::Sidecar;
-    collection.image_generation_mode = CodexLocalAccessImageGenerationMode::ImagesOnly;
+    collection.image_generation_mode = CodexLocalAccessImageGenerationMode::Enabled;
     collection.account_ids.clear();
     collection.custom_routing_rules.clear();
     collection.account_model_rules.clear();
@@ -16401,10 +16470,6 @@ async fn run_local_access_chat_stream_dialog(
     let response = match client
         .post(&url)
         .header(AUTHORIZATION, format!("Bearer {}", api_key.trim()))
-        .header(
-            CODEX_LOCAL_ACCESS_TEST_DISABLE_IMAGE_GENERATION_HEADER,
-            "chat",
-        )
         .header(CONTENT_TYPE, "application/json")
         .header(ACCEPT, "text/event-stream")
         .json(&body)
@@ -16598,10 +16663,6 @@ async fn run_local_access_chat_dialog(
     let response = match client
         .post(&url)
         .header(AUTHORIZATION, format!("Bearer {}", api_key.trim()))
-        .header(
-            CODEX_LOCAL_ACCESS_TEST_DISABLE_IMAGE_GENERATION_HEADER,
-            "chat",
-        )
         .header(CONTENT_TYPE, "application/json")
         .header(ACCEPT, "application/json")
         .json(&body)
@@ -17870,37 +17931,6 @@ pub async fn update_local_access_client_base_url_host(
     snapshot_state().await
 }
 
-pub async fn update_local_access_image_generation_mode(
-    image_generation_mode: CodexLocalAccessImageGenerationMode,
-) -> Result<CodexLocalAccessState, String> {
-    ensure_runtime_loaded().await?;
-
-    let maybe_collection = {
-        let runtime = gateway_runtime().lock().await;
-        runtime.collection.clone()
-    };
-
-    let Some(mut collection) = maybe_collection else {
-        return Err("本地接入集合尚未创建".to_string());
-    };
-
-    if collection.image_generation_mode == image_generation_mode {
-        return snapshot_state().await;
-    }
-
-    collection.image_generation_mode = image_generation_mode;
-    collection.updated_at = now_ms();
-    save_collection_to_disk(&collection)?;
-
-    {
-        let mut runtime = gateway_runtime().lock().await;
-        sync_runtime_collection(&mut runtime, collection);
-    }
-
-    ensure_gateway_matches_runtime().await?;
-    snapshot_state().await
-}
-
 pub async fn remove_local_access_account(
     account_id: &str,
 ) -> Result<CodexLocalAccessState, String> {
@@ -18265,7 +18295,6 @@ pub async fn delete_local_access_api_key(
 
 pub async fn update_local_access_bound_oauth_account(
     bound_oauth_account_id: Option<String>,
-    bound_oauth_use_local_gateway: bool,
     bound_oauth_quota_reserve: Option<CodexLocalAccessQuotaReserve>,
 ) -> Result<CodexLocalAccessState, String> {
     ensure_runtime_loaded_without_start().await?;
@@ -18291,17 +18320,7 @@ pub async fn update_local_access_bound_oauth_account(
         collection.bound_oauth_account_id = None;
         collection.bound_oauth_quota_reserve = None;
     }
-    if has_bound_oauth {
-        if bound_oauth_use_local_gateway {
-            if collection.image_generation_mode != CodexLocalAccessImageGenerationMode::Disabled {
-                collection.image_generation_mode = CodexLocalAccessImageGenerationMode::ImagesOnly;
-            }
-        } else if collection.image_generation_mode
-            == CodexLocalAccessImageGenerationMode::ImagesOnly
-        {
-            collection.image_generation_mode = CodexLocalAccessImageGenerationMode::Enabled;
-        }
-    }
+    collection.image_generation_mode = CodexLocalAccessImageGenerationMode::Enabled;
     collection.updated_at = now_ms();
     save_collection_to_disk(&collection)?;
     let bound_account_id_for_quota_reserve = collection.bound_oauth_account_id.clone();
@@ -20568,12 +20587,6 @@ fn build_account_scoped_upstream_body<'a>(
     };
     let remove_all_image_capabilities =
         !image_generation_tools_allowed(image_generation_mode, request_kind);
-    let image_generation_mode = if account_uses_oauth_chat_image_generation_compat(account) {
-        oauth_chat_image_generation_mode(image_generation_mode)
-    } else {
-        image_generation_mode
-    };
-
     if remove_all_image_capabilities {
         if !remove_image_generation_capabilities_from_object(body_obj) {
             return Ok(Cow::Borrowed(body));
@@ -23226,6 +23239,34 @@ async fn handle_connection(
 mod tests {
 
     #[test]
+    fn calendar_stats_windows_start_at_local_day_week_and_month() {
+        use chrono::{Datelike, TimeZone, Timelike};
+
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 7, 15, 12, 30, 0)
+            .single()
+            .expect("test local time should exist");
+        let (day_start, week_start, month_start) =
+            super::local_calendar_window_starts(now.timestamp_millis());
+        let local_date_time = |timestamp| {
+            chrono::Local
+                .timestamp_millis_opt(timestamp)
+                .single()
+                .expect("calendar boundary should be a local instant")
+        };
+        let day = local_date_time(day_start);
+        let week = local_date_time(week_start);
+        let month = local_date_time(month_start);
+
+        assert_eq!((day.year(), day.month(), day.day()), (2026, 7, 15));
+        assert_eq!((week.year(), week.month(), week.day()), (2026, 7, 13));
+        assert_eq!((month.year(), month.month(), month.day()), (2026, 7, 1));
+        assert_eq!((day.hour(), day.minute(), day.second()), (0, 0, 0));
+        assert_eq!((week.hour(), week.minute(), week.second()), (0, 0, 0));
+        assert_eq!((month.hour(), month.minute(), month.second()), (0, 0, 0));
+    }
+
+    #[test]
     fn port_in_reserved_ranges_detects_membership() {
         assert!(super::port_in_reserved_ranges(1450, &[(1400, 1500)]));
         assert!(!super::port_in_reserved_ranges(1399, &[(1400, 1500)]));
@@ -23271,8 +23312,9 @@ mod tests {
         count_request_logs_for_model_ids, default_codex_model_ids, effective_api_key_account_ids,
         empty_stats_snapshot, extract_usage_capture,
         filter_bound_oauth_quota_reserve_account, filter_websocket_client_message,
-        insert_local_access_usage_event, inspect_local_access_profile_config,
-        is_codex_local_access_auth_text, is_codex_local_access_config_for_api_key,
+        insert_local_access_usage_event, inspect_local_access_profile_attachment,
+        inspect_local_access_profile_config, is_codex_local_access_auth_text,
+        is_codex_local_access_config_for_api_key, is_codex_oauth_auth_text,
         is_image_generation_capability_error, is_local_access_eligible_account,
         is_local_access_gateway_base_url, is_provider_gateway_eligible_account,
         is_responses_completion_event, is_stream_incomplete_error_message,
@@ -23321,8 +23363,7 @@ mod tests {
         ResolvedLocalApiKey, ResponseUsageCollector, RoutingCandidate, SidecarUsageDetails,
         SidecarUsageEvent, UsageCapture, BOUND_OAUTH_QUOTA_RESERVE_MAX_SNAPSHOT_AGE_SECONDS,
         CODEX_AUTO_REVIEW_MODEL_ID, CODEX_IMAGE_MODEL_ID, CODEX_LOCAL_ACCESS_MODEL_CATALOG_FILE,
-        CODEX_IMAGEGEN_ACTOR_HEADER,
-        CODEX_LOCAL_ACCESS_TEST_DISABLE_IMAGE_GENERATION_HEADER, CODEX_PROFILE_AUTH_FILE,
+        CODEX_IMAGEGEN_ACTOR_HEADER, CODEX_PROFILE_AUTH_FILE,
         CODEX_PROFILE_CONFIG_FILE, CODEX_PROVIDER_MODEL_BACKUP_FILE,
         CODEX_PROVIDER_MODEL_CATALOG_FILE, DEFAULT_MAX_RETRY_INTERVAL_MS,
         DEFAULT_MODEL_PRICING_VERSION, DEFAULT_SESSION_AFFINITY_TTL_MS, MAX_HTTP_REQUEST_BYTES,
@@ -23815,7 +23856,7 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
 
         account.bound_oauth_use_local_gateway = true;
         assert!(!account_requires_provider_gateway(&account));
-        assert!(account_requires_bound_oauth_local_gateway(&account));
+        assert!(!account_requires_bound_oauth_local_gateway(&account));
         assert!(is_local_access_eligible_account(&account, false));
 
         account.bound_oauth_account_id = None;
@@ -25858,6 +25899,12 @@ enabled = true
             r#"{"tokens":{"access_token":"official"}}"#,
             "local-key"
         ));
+        assert!(is_codex_oauth_auth_text(
+            r#"{"tokens":{"id_token":"official-id-token","access_token":"official"}}"#
+        ));
+        assert!(!is_codex_oauth_auth_text(
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"local-key"}"#
+        ));
     }
 
     #[test]
@@ -25878,6 +25925,7 @@ supports_websockets = false
             config,
             "http://localhost:14998/v1",
             "agt_codex_test",
+            false,
         )
         .expect("inspect config");
 
@@ -25893,7 +25941,7 @@ supports_websockets = false
     }
 
     #[test]
-    fn local_access_profile_config_rejects_legacy_imagegen_auth_gate() {
+    fn local_access_profile_config_accepts_bound_oauth_auth_gate() {
         let config = r#"model_provider = "codex_local_access"
 
 [model_providers.codex_local_access]
@@ -25909,11 +25957,53 @@ supports_websockets = false
             config,
             "http://localhost:14998/v1",
             "agt_codex_test",
+            true,
         )
-        .expect("inspect legacy config");
+        .expect("inspect bound OAuth config");
 
-        assert!(!inspection.config_attached);
+        assert!(inspection.config_attached);
         assert!(inspection.token_matched);
+
+        let unbound_inspection = inspect_local_access_profile_config(
+            config,
+            "http://localhost:14998/v1",
+            "agt_codex_test",
+            false,
+        )
+        .expect("inspect unbound config");
+        assert!(!unbound_inspection.config_attached);
+    }
+
+    #[test]
+    fn local_access_profile_attachment_accepts_bound_oauth_projection() {
+        let dir = make_temp_dir("codex-local-access-bound-oauth-attachment");
+        let config = r#"model_provider = "codex_local_access"
+
+[model_providers.codex_local_access]
+name = "Codex API Service"
+base_url = "http://localhost:14998/v1"
+wire_api = "responses"
+requires_openai_auth = true
+experimental_bearer_token = "local-api-key"
+supports_websockets = false
+"#;
+        fs::write(dir.join(CODEX_PROFILE_CONFIG_FILE), config).expect("write config");
+        fs::write(
+            dir.join(CODEX_PROFILE_AUTH_FILE),
+            r#"{"tokens":{"id_token":"official-id-token","access_token":"official","refresh_token":"refresh"}}"#,
+        )
+        .expect("write auth");
+
+        let mut collection = test_local_access_collection(Vec::new());
+        collection.bound_oauth_account_id = Some("oauth-account".to_string());
+        let attachment = inspect_local_access_profile_attachment(&dir, Some(&collection));
+
+        assert!(attachment.attached);
+        assert!(attachment.config_attached);
+        assert!(attachment.auth_attached);
+        assert!(attachment.error.is_none());
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -25934,12 +26024,14 @@ supports_websockets = false
             config,
             "http://127.0.0.1:14999/v1",
             "agt_codex_old",
+            false,
         )
         .expect("inspect stale port");
         let stale_key = inspect_local_access_profile_config(
             config,
             "http://127.0.0.1:14998/v1",
             "agt_codex_new",
+            false,
         )
         .expect("inspect stale key");
 
@@ -27326,7 +27418,7 @@ data: {"type":"response.completed","response":{"id":"resp_123","usage":{"input_t
     }
 
     #[test]
-    fn injects_image_generation_tool_only_for_non_free_api_key_responses_accounts() {
+    fn injects_image_generation_tool_for_non_free_responses_accounts() {
         let request = ParsedRequest {
             method: "POST".to_string(),
             target: "/v1/responses".to_string(),
@@ -27354,7 +27446,7 @@ data: {"type":"response.completed","response":{"id":"resp_123","usage":{"input_t
         .expect("paid oauth body should build");
         let paid_oauth_mapped_body: Value = serde_json::from_slice(paid_oauth_body.as_ref())
             .expect("paid oauth body should be json");
-        assert!(!has_image_generation_tool(&paid_oauth_mapped_body));
+        assert!(has_image_generation_tool(&paid_oauth_mapped_body));
 
         let api_key_account = CodexAccount::new_api_key(
             "api-key-1".to_string(),
@@ -27627,7 +27719,7 @@ data: {"type":"response.completed","response":{"id":"resp_123","usage":{"input_t
     }
 
     #[test]
-    fn request_image_generation_header_uses_images_only_without_persisted_change() {
+    fn removed_image_generation_header_no_longer_disables_capability() {
         let mut headers = HashMap::new();
 
         assert_eq!(
@@ -27636,25 +27728,25 @@ data: {"type":"response.completed","response":{"id":"resp_123","usage":{"input_t
         );
 
         headers.insert(
-            CODEX_LOCAL_ACCESS_TEST_DISABLE_IMAGE_GENERATION_HEADER.to_string(),
+            "x-agtools-disable-image-generation".to_string(),
             "chat".to_string(),
         );
         assert_eq!(
             request_image_generation_mode(CodexLocalAccessImageGenerationMode::Enabled, &headers),
-            CodexLocalAccessImageGenerationMode::ImagesOnly
+            CodexLocalAccessImageGenerationMode::Enabled
         );
         assert_eq!(
             request_image_generation_mode(CodexLocalAccessImageGenerationMode::Disabled, &headers),
-            CodexLocalAccessImageGenerationMode::Disabled
+            CodexLocalAccessImageGenerationMode::Enabled
         );
 
         headers.insert(
-            CODEX_LOCAL_ACCESS_TEST_DISABLE_IMAGE_GENERATION_HEADER.to_string(),
+            "x-agtools-disable-image-generation".to_string(),
             "true".to_string(),
         );
         assert_eq!(
             request_image_generation_mode(CodexLocalAccessImageGenerationMode::Enabled, &headers),
-            CodexLocalAccessImageGenerationMode::Disabled
+            CodexLocalAccessImageGenerationMode::Enabled
         );
     }
 
@@ -28644,7 +28736,7 @@ data: {"error":{"code":"server_error","type":"upstream","message":"stream aborte
 
         assert_eq!(
             direct_collection.image_generation_mode,
-            CodexLocalAccessImageGenerationMode::ImagesOnly
+            CodexLocalAccessImageGenerationMode::Enabled
         );
 
         let provider_gateway = CodexLocalAccessProviderGateway {
@@ -28668,7 +28760,7 @@ data: {"error":{"code":"server_error","type":"upstream","message":"stream aborte
 
         assert_eq!(
             chat_collection.image_generation_mode,
-            CodexLocalAccessImageGenerationMode::ImagesOnly
+            CodexLocalAccessImageGenerationMode::Enabled
         );
     }
 
@@ -28704,7 +28796,6 @@ data: {"error":{"code":"server_error","type":"upstream","message":"stream aborte
         )
         .expect("parse sidecar config");
 
-        assert_eq!(config.get("disable-image-generation"), Some(&json!("chat")));
         assert_eq!(config.get("disable-auth-auto-refresh"), Some(&json!(true)));
 
         fs::remove_dir_all(&dir).expect("cleanup temp dir");
@@ -28733,12 +28824,11 @@ data: {"error":{"code":"server_error","type":"upstream","message":"stream aborte
         )
         .await
         .expect("sidecar config should build");
-        let config: Value = serde_json::from_str(
+        let _config: Value = serde_json::from_str(
             &fs::read_to_string(&launch_config.config_path).expect("read sidecar config"),
         )
         .expect("parse sidecar config");
 
-        assert_eq!(config.get("disable-image-generation"), Some(&json!("chat")));
 
         fs::remove_dir_all(&dir).expect("cleanup temp dir");
     }
@@ -28793,7 +28883,6 @@ data: {"error":{"code":"server_error","type":"upstream","message":"stream aborte
         )
         .expect("parse sidecar manifest");
 
-        assert_eq!(config.get("disable-image-generation"), Some(&json!("chat")));
         assert_eq!(
             config
                 .get("api-key-account-ids")
@@ -29001,7 +29090,7 @@ data: {"error":{"code":"server_error","type":"upstream","message":"stream aborte
     }
 
     #[test]
-    fn provider_gateway_oauth_compat_forces_images_only_mode() {
+    fn provider_gateway_oauth_binding_keeps_image_generation_enabled() {
         let mut account = CodexAccount::new_api_key(
             "api-1".to_string(),
             "api-key@example.com".to_string(),
@@ -29021,7 +29110,7 @@ data: {"error":{"code":"server_error","type":"upstream","message":"stream aborte
                 &account,
                 CodexLocalAccessImageGenerationMode::Enabled,
             ),
-            CodexLocalAccessImageGenerationMode::ImagesOnly
+            CodexLocalAccessImageGenerationMode::Enabled
         );
 
         assert_eq!(
@@ -29029,7 +29118,7 @@ data: {"error":{"code":"server_error","type":"upstream","message":"stream aborte
                 &account,
                 CodexLocalAccessImageGenerationMode::Disabled,
             ),
-            CodexLocalAccessImageGenerationMode::Disabled
+            CodexLocalAccessImageGenerationMode::Enabled
         );
 
         account.bound_oauth_use_local_gateway = false;
@@ -29038,7 +29127,7 @@ data: {"error":{"code":"server_error","type":"upstream","message":"stream aborte
                 &account,
                 CodexLocalAccessImageGenerationMode::Disabled,
             ),
-            CodexLocalAccessImageGenerationMode::Disabled
+            CodexLocalAccessImageGenerationMode::Enabled
         );
     }
 
@@ -29067,6 +29156,21 @@ data: {"error":{"code":"server_error","type":"upstream","message":"stream aborte
 
         assert!(!collection.session_affinity);
         assert!(collection.session_affinity_default_enabled_migrated);
+    }
+
+    #[test]
+    fn sanitize_collection_removes_saved_image_generation_disable_mode() {
+        let mut collection = test_local_access_collection(Vec::new());
+        collection.image_generation_mode = CodexLocalAccessImageGenerationMode::Disabled;
+
+        let (changed, _) = sanitize_collection_with_accounts(&mut collection, &[])
+            .expect("collection should sanitize");
+
+        assert!(changed);
+        assert_eq!(
+            collection.image_generation_mode,
+            CodexLocalAccessImageGenerationMode::Enabled
+        );
     }
 
     #[test]

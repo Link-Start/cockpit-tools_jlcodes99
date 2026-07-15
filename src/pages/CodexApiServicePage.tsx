@@ -70,7 +70,6 @@ import type {
   CodexLocalAccessCollection,
   CodexLocalAccessCustomRoutingRule,
   CodexLocalAccessGatewayMode,
-  CodexLocalAccessImageGenerationMode,
   CodexLocalAccessModelAlias,
   CodexLocalAccessModelPricing,
   CodexLocalAccessRequestKind,
@@ -92,13 +91,18 @@ import { filterCodexLocalAccessAccountIds } from "../utils/codexLocalAccessAccou
 import { scrollElementTo } from "../utils/reducedMotion";
 import { SingleSelectDropdown } from "../components/SingleSelectDropdown";
 import { CodexLocalAccessModal } from "../components/CodexLocalAccessModal";
+import { CodexStatsRangePicker } from "../components/CodexStatsRangePicker";
 import { PaginationControls } from "../components/PaginationControls";
 import { useCodexAccountOverviewMemberView } from "../hooks/useCodexAccountOverviewMemberView";
+import {
+  buildCodexStatsTimeRange,
+  type CodexStatsRangeKey,
+  type CodexStatsTimeRange,
+} from "../utils/codexStatsRange";
 import "./CodexApiServicePage.css";
 
 type ServiceTab = "overview" | "keys" | "accounts" | "models" | "logs";
 type StatsLogTab = "accounts" | "logs" | "models" | "keys";
-type StatsRangeKey = "daily" | "weekly" | "monthly";
 type CopyField =
   | "baseUrl"
   | "lanBaseUrl"
@@ -202,12 +206,12 @@ function persistAddressKind(value: CodexLocalAccessAddressKind): void {
   }
 }
 
-function normalizeStatsRange(value: string | null | undefined): StatsRangeKey {
+function normalizeStatsRange(value: string | null | undefined): CodexStatsRangeKey {
   if (value === "weekly" || value === "monthly") return value;
   return "daily";
 }
 
-function readStoredStatsRange(): StatsRangeKey {
+function readStoredStatsRange(): CodexStatsRangeKey {
   try {
     return normalizeStatsRange(localStorage.getItem(STATS_RANGE_STORAGE_KEY));
   } catch {
@@ -215,7 +219,7 @@ function readStoredStatsRange(): StatsRangeKey {
   }
 }
 
-function persistStatsRange(value: StatsRangeKey): void {
+function persistStatsRange(value: CodexStatsRangeKey): void {
   try {
     localStorage.setItem(STATS_RANGE_STORAGE_KEY, value);
   } catch {
@@ -675,9 +679,15 @@ export function CodexApiServicePage() {
   const [groups, setGroups] = useState<CodexAccountGroup[]>([]);
   const [activeTab, setActiveTab] = useState<ServiceTab>("overview");
   const [statsLogTab, setStatsLogTab] = useState<StatsLogTab>("logs");
-  const [statsRange, setStatsRange] = useState<StatsRangeKey>(() =>
+  const [statsRange, setStatsRange] = useState<CodexStatsRangeKey>(() =>
     readStoredStatsRange(),
   );
+  const [statsTimeRange, setStatsTimeRange] = useState<CodexStatsTimeRange>(() =>
+    buildCodexStatsTimeRange(readStoredStatsRange()),
+  );
+  const [filteredStatsWindow, setFilteredStatsWindow] =
+    useState<CodexLocalAccessStatsWindow | null>(null);
+  const [statsRangeError, setStatsRangeError] = useState("");
   const [addressKind, setAddressKind] = useState<CodexLocalAccessAddressKind>(
     () => readStoredAddressKind(),
   );
@@ -756,6 +766,7 @@ export function CodexApiServicePage() {
   const [requestLogErrorQuery, setRequestLogErrorQuery] = useState("");
   const mountedRef = useRef(true);
   const stateRequestSeqRef = useRef(0);
+  const statsRequestSeqRef = useRef(0);
   const testChatScrollRef = useRef<HTMLDivElement | null>(null);
 
   const collection = state?.collection ?? null;
@@ -798,9 +809,12 @@ export function CodexApiServicePage() {
   const selectedTimeoutPresetIsCustom = Boolean(
     selectedTimeoutPreset && !selectedTimeoutPreset.builtin,
   );
-  const selectedStatsWindow: CodexLocalAccessStatsWindow | null = stats
-    ? stats[statsRange]
-    : null;
+  const selectedStatsWindow =
+    useMemo<CodexLocalAccessStatsWindow | null>(() => {
+      if (filteredStatsWindow) return filteredStatsWindow;
+      if (!stats || statsRange === "custom") return null;
+      return stats[statsRange];
+    }, [filteredStatsWindow, stats, statsRange]);
   const apiKeyStatsById = new Map(
     (selectedStatsWindow?.apiKeys ?? []).map((item) => [item.apiKeyId, item]),
   );
@@ -852,7 +866,6 @@ export function CodexApiServicePage() {
     addressKind === "lan" && state?.lanBaseUrl ? state.lanBaseUrl : baseUrl;
   const accessScope = collection?.accessScope ?? "localhost";
   const clientBaseUrlHost = collection?.clientBaseUrlHost ?? "localhost";
-  const imageGenerationMode = collection?.imageGenerationMode ?? "enabled";
   const routingStrategy = collection?.routingStrategy ?? "auto";
   const gatewayMode = collection?.gatewayMode ?? "sidecar";
   const modelIds = state?.modelIds ?? [];
@@ -1150,13 +1163,6 @@ export function CodexApiServicePage() {
     }
   }, []);
 
-  const handleStatsRangeChange = useCallback(
-    (nextRange: StatsRangeKey) => {
-      setStatsRange(nextRange);
-    },
-    [],
-  );
-
   useEffect(() => {
     mountedRef.current = true;
     void reloadState().catch((err) =>
@@ -1255,6 +1261,34 @@ export function CodexApiServicePage() {
   }, [statsRange]);
 
   useEffect(() => {
+    const requestSeq = ++statsRequestSeqRef.current;
+    setStatsRangeError("");
+    void codexLocalAccessService
+      .queryCodexLocalAccessStats(statsTimeRange.startAt, statsTimeRange.endAt)
+      .then((window) => {
+        if (!mountedRef.current || requestSeq !== statsRequestSeqRef.current) return;
+        setFilteredStatsWindow(window);
+      })
+      .catch((err) => {
+        if (!mountedRef.current || requestSeq !== statsRequestSeqRef.current) return;
+        setStatsRangeError(String(err).replace(/^Error:\s*/, ""));
+      });
+  }, [statsTimeRange.endAt, statsTimeRange.startAt, stats?.updatedAt]);
+
+  const handleStatsPresetChange = (
+    key: Exclude<CodexStatsRangeKey, "custom">,
+    range: CodexStatsTimeRange,
+  ) => {
+    setStatsRange(key);
+    setStatsTimeRange(range);
+  };
+
+  const handleCustomStatsRangeApply = (range: CodexStatsTimeRange) => {
+    setStatsRange("custom");
+    setStatsTimeRange(range);
+  };
+
+  useEffect(() => {
     persistAddressKind(addressKind);
   }, [addressKind]);
 
@@ -1266,6 +1300,8 @@ export function CodexApiServicePage() {
     setRequestLogPage(1);
   }, [
     statsRange,
+    statsTimeRange.startAt,
+    statsTimeRange.endAt,
     requestLogPageSize,
     requestLogKindFilter,
     requestLogStatusFilter,
@@ -1291,7 +1327,9 @@ export function CodexApiServicePage() {
       .queryCodexLocalAccessRequestLogs({
         page: requestLogPage,
         pageSize: requestLogPageSize,
-        statsRange,
+        statsRange: statsRange === "custom" ? null : statsRange,
+        startAt: statsTimeRange.startAt,
+        endAt: statsTimeRange.endAt,
         modelQuery: requestLogModelQuery,
         accountQuery: requestLogAccountQuery,
         apiKeyQuery: requestLogApiKeyQuery,
@@ -1328,6 +1366,8 @@ export function CodexApiServicePage() {
     activeTab,
     statsLogTab,
     statsRange,
+    statsTimeRange.startAt,
+    statsTimeRange.endAt,
     requestLogPage,
     requestLogPageSize,
     requestLogKindFilter,
@@ -1690,25 +1730,6 @@ export function CodexApiServicePage() {
         setState(next);
       },
       t("codex.localAccess.clientBaseUrlHostSaveSuccess", "客户端地址已更新"),
-    );
-  };
-
-  const handleUpdateImageMode = async (value: string) => {
-    const mode = (
-      value === "images_only" || value === "disabled" ? value : "enabled"
-    ) as CodexLocalAccessImageGenerationMode;
-    await runAction(
-      async () => {
-        const next =
-          await codexLocalAccessService.updateCodexLocalAccessImageGenerationMode(
-            mode,
-          );
-        setState(next);
-      },
-      t(
-        "codex.localAccess.imageGenerationSaveSuccess",
-        "image_generation 设置已更新",
-      ),
     );
   };
 
@@ -2817,20 +2838,6 @@ export function CodexApiServicePage() {
     { value: "localhost", label: "localhost" },
     { value: "127.0.0.1", label: "127.0.0.1" },
   ];
-  const imageModeOptions = [
-    {
-      value: "enabled",
-      label: t("codex.localAccess.imageGenerationMode.enabled", "启用"),
-    },
-    {
-      value: "images_only",
-      label: t("codex.localAccess.imageGenerationMode.imagesOnly", "仅图片"),
-    },
-    {
-      value: "disabled",
-      label: t("codex.localAccess.imageGenerationMode.disabled", "禁用"),
-    },
-  ];
   const routingOptions = [
     {
       value: "auto",
@@ -2875,29 +2882,14 @@ export function CodexApiServicePage() {
       label: t("codex.localAccess.routingStrategy.custom", "自定义"),
     },
   ];
-  const statsRangeOptions = [
-    {
-      key: "daily" as const,
-      label: t("codex.localAccess.statsRange.daily", "日"),
-      window: t("codex.apiService.statsRange.today", "Today"),
-      title: t("codex.apiService.statsRange.today", "Today"),
-    },
-    {
-      key: "weekly" as const,
-      label: t("codex.localAccess.statsRange.weekly", "周"),
-      window: t("codex.apiService.statsRange.thisWeek", "This week"),
-      title: t("codex.apiService.statsRange.thisWeek", "This week"),
-    },
-    {
-      key: "monthly" as const,
-      label: t("codex.localAccess.statsRange.monthly", "月"),
-      window: t("codex.apiService.statsRange.thisMonth", "This month"),
-      title: t("codex.apiService.statsRange.thisMonth", "This month"),
-    },
-  ];
-  const selectedStatsRangeOption =
-    statsRangeOptions.find((option) => option.key === statsRange) ??
-    statsRangeOptions[0];
+  const selectedStatsRangeTitle =
+    statsRange === "daily"
+      ? t("codex.apiService.statsRange.today", "Today")
+      : statsRange === "weekly"
+        ? t("codex.apiService.statsRange.thisWeek", "This week")
+        : statsRange === "monthly"
+          ? t("codex.apiService.statsRange.thisMonth", "This month")
+          : `${statsTimeRange.startInput} - ${statsTimeRange.endInput}`;
   const requestLogKindOptions: Array<{
     value: RequestLogKindFilter;
     label: string;
@@ -3258,35 +3250,22 @@ export function CodexApiServicePage() {
                 {t("codex.apiService.usage.title", "用量统计")}
               </strong>
               <span>
-                {selectedStatsRangeOption.title}
+                {selectedStatsRangeTitle}
                 {stats?.updatedAt
                   ? ` · ${t("codex.apiService.usage.lastRecorded", "最近入账")} ${formatDateTime(stats.updatedAt)}`
                   : ""}
               </span>
             </div>
           </div>
-          <div
-            className="codex-api-service-range-tabs"
-            role="group"
-            aria-label={t(
-              "codex.apiService.keys.usageRange",
-              "Key 用量统计周期",
-            )}
-          >
-            {statsRangeOptions.map((option) => (
-              <button
-                key={option.key}
-                type="button"
-                className={statsRange === option.key ? "active" : ""}
-                aria-pressed={statsRange === option.key}
-                title={option.title}
-                onClick={() => handleStatsRangeChange(option.key)}
-              >
-                <span>{option.label}</span>
-                <small>{option.window}</small>
-              </button>
-            ))}
-          </div>
+          <CodexStatsRangePicker
+            value={statsRange}
+            range={statsTimeRange}
+            onPresetChange={handleStatsPresetChange}
+            onCustomApply={handleCustomStatsRangeApply}
+            disabled={busy}
+            error={statsRangeError}
+            compact
+          />
         </section>
 
         <section className="codex-api-service-summary-grid">
@@ -3766,14 +3745,14 @@ export function CodexApiServicePage() {
                         </div>
                       </div>
                       <div
-                        key={statsRange}
+                        key={`${statsRange}:${statsTimeRange.startAt}:${statsTimeRange.endAt}`}
                         className="api-key-usage-grid"
                         aria-live="polite"
-                        aria-label={`${selectedStatsRangeOption.title} Key 用量`}
+                        aria-label={`${selectedStatsRangeTitle} Key 用量`}
                       >
                         <div className="api-key-usage-grid-head">
                           <Activity size={14} />
-                          <span>{selectedStatsRangeOption.title}</span>
+                          <span>{selectedStatsRangeTitle}</span>
                         </div>
                         <div>
                           <span>
@@ -4500,24 +4479,6 @@ export function CodexApiServicePage() {
                   </h2>
                 </div>
                 <div className="codex-api-service-config-list">
-                  <label>
-                    <span>
-                      {t(
-                        "codex.localAccess.imageGenerationLabel",
-                        "image_generation",
-                      )}
-                    </span>
-                    <SingleSelectDropdown
-                      value={imageGenerationMode}
-                      options={imageModeOptions}
-                      onChange={(value) => void handleUpdateImageMode(value)}
-                      disabled={busy || !collection}
-                      ariaLabel={t(
-                        "codex.localAccess.imageGenerationLabel",
-                        "image_generation",
-                      )}
-                    />
-                  </label>
                   <label>
                     <span>
                       {t("codex.localAccess.accessScopeLabel", "访问范围")}
